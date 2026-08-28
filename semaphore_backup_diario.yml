@@ -1,0 +1,82 @@
+---
+# Playbook: Backup Diário dos Clientes
+#
+# Rodado pelo Semaphore via Schedule (cron nativo, com timezone). Ao contrário
+# do provisionamento, este playbook usa um Inventory FIXO — "Clientes Ativos"
+# — porque roda contra todo mundo que já existe, não contra uma VPS nova.
+#
+# O que este playbook FAZ, sem depender de nada externo:
+#   - dump do MariaDB (Ritmo/ERPNext) de cada cliente
+#   - tar dos volumes que têm dado real do lojista (uploads do Chatwoot,
+#     dados do N8N/Harmonia)
+#   - guarda os últimos 7 dias localmente na própria VPS, apaga o resto
+#
+# O que este playbook NÃO faz, por falta de uma decisão real (não é chute):
+#   - envio pra armazenamento externo (S3, Backblaze, etc.) — não sei qual
+#     provedor a Nomen usa/paga, nem se já existe uma credencial pra isso.
+#     Sem isso, o backup protege contra "erro humano dentro da própria VPS"
+#     mas NÃO contra a VPS inteira sumir (disco corrompido, conta suspensa
+#     no provedor). Me passa o provedor + credencial quando tiver, que eu
+#     adiciono a etapa de envio.
+
+- name: Backup diário — Ritmo (MariaDB) + volumes com dado real
+  hosts: clientes_ativos
+  gather_facts: true
+  vars:
+    dir_backup: "/root/backups"
+    retencao_dias: 7
+
+  tasks:
+    - name: Garante que a pasta de backup existe
+      ansible.builtin.file:
+        path: "{{ dir_backup }}"
+        state: directory
+        mode: "0700"
+
+    - name: Descobre o nome do container do banco do Ritmo
+      ansible.builtin.command:
+        cmd: docker ps --filter "name=ritmo-db" --format "{{ '{{.Names}}' }}"
+      register: container_db
+      changed_when: false
+
+    - name: Dump do MariaDB do Ritmo
+      ansible.builtin.shell: >
+        docker exec {{ container_db.stdout }}
+        sh -c 'exec mariadb-dump --all-databases -uroot -p"$MYSQL_ROOT_PASSWORD"'
+        | gzip > {{ dir_backup }}/ritmo_{{ inventory_hostname }}_{{ ansible_date_time.date }}.sql.gz
+      when: container_db.stdout | length > 0
+      register: dump_ritmo
+      changed_when: dump_ritmo.rc == 0
+
+    - name: Tar dos volumes com dado real (uploads Chatwoot + dados N8N)
+      ansible.builtin.shell: >
+        tar czf {{ dir_backup }}/volumes_{{ inventory_hostname }}_{{ ansible_date_time.date }}.tar.gz
+        -C /var/lib/docker/volumes
+        $(docker volume ls --format "{{ '{{.Name}}' }}" | grep -E 'chatwoot|n8n')
+      args:
+        warn: false
+      register: tar_volumes
+      changed_when: tar_volumes.rc == 0
+
+    - name: Remove backups com mais de {{ retencao_dias }} dias
+      ansible.builtin.find:
+        paths: "{{ dir_backup }}"
+        age: "{{ retencao_dias }}d"
+        recurse: false
+      register: backups_antigos
+
+    - name: Apaga os arquivos antigos encontrados
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ backups_antigos.files }}"
+
+    - name: Confirma o que ficou salvo hoje
+      ansible.builtin.find:
+        paths: "{{ dir_backup }}"
+        patterns: "*{{ ansible_date_time.date }}*"
+      register: backups_hoje
+
+    - name: Mostra o resumo
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ backups_hoje.files | length }} arquivo(s) de backup salvos hoje"
